@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
-
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Votes.sol";
@@ -12,22 +11,25 @@ contract SeatToken is ERC20, ERC20Permit, ERC20Votes {
         string memory name,
         string memory symbol,
         address _minter
-    )
-        ERC20(name, symbol)
-        ERC20Permit(name) // <--- 这里必须传 name
-    {
+    ) ERC20(name, symbol) ERC20Permit(name) {
         minter = _minter;
     }
 
     function mint(address to, uint256 amount) external {
         require(msg.sender == minter, "Only minter");
         _mint(to, amount);
+        // 如果用户从未委派过，默认委派给自己
         if (delegates(to) == address(0)) {
             _delegate(to, to);
         }
     }
 
-    // 必须重写 _update 以兼容 ERC20 和 ERC20Votes (OZ 5.x 标准)
+    // 新增：由核心合约调用的同步委派
+    function forceDelegate(address delegator, address delegatee) external {
+        require(msg.sender == minter, "Only minter");
+        _delegate(delegator, delegatee);
+    }
+
     function _update(
         address from,
         address to,
@@ -37,22 +39,16 @@ contract SeatToken is ERC20, ERC20Permit, ERC20Votes {
         super._update(from, to, value);
     }
 
-    // 必须重写 nonces 以兼容 ERC20Permit 和 Nonces (OZ 5.x 标准)
     function nonces(
         address owner
     ) public view override(ERC20Permit, Nonces) returns (uint256) {
         return super.nonces(owner);
     }
 
-    function clock() public view virtual override returns (uint48) {
+    function clock() public view override returns (uint48) {
         return uint48(block.timestamp);
     }
-
-    /**
-     * @dev 告知外部工具（如 Etherscan 或客户端）此合约使用时间戳模式
-     */
-    // solhint-disable-next-line func-name-mixedcase
-    function CLOCK_MODE() public view virtual override returns (string memory) {
+    function CLOCK_MODE() public view override returns (string memory) {
         return "mode=timestamp";
     }
 }

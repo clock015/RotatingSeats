@@ -2,221 +2,263 @@
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/governance/utils/IVotes.sol";
-import "./interfaces/ITokenA.sol";
+import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import "@openzeppelin/contracts/utils/Nonces.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "./interfaces/ISeatToken.sol";
 import "./interfaces/ISeatTokenFactory.sol";
 
-contract ProportionalElection is IVotes {
-    ITokenA public immutable tokenA;
+/**
+ * @title ProportionalElection
+ * @notice 动态权重治理聚合器：
+ * 1. 每一年的总治理权重被归一化为 100 票。
+ * 2. 采用 5 年滑动窗口，总治理权上限为 500 票。
+ * 3. 每一轮次（360天）的前 30 天为“积累缓冲期”，该轮次的权重暂不计入总投票权。
+ */
+contract ProportionalElection is IVotes, EIP712, Nonces {
+    // --- 常量定义 ---
+    uint256 public constant CYCLE_DURATION = 360 days;
+    uint256 public constant BUFFER_DURATION = 30 days;
+    uint256 public constant WEIGHT_PER_YEAR = 100 * 1e18; // 归一化基准
+    uint256 public constant MAX_ACTIVE_ROUNDS = 5; // 活跃窗口长度
+
+    // --- 状态变量 ---
     ISeatTokenFactory public immutable seatFactory;
+    uint256 public immutable genesisTime;
 
-    uint256 public immutable genesisTime; // 项目启动时间
-    uint256 public constant ELECTION_CYCLE = 360 days;
-    uint256 public constant VOTING_DURATION = 7 days;
-    uint256 public constant SEATS_PER_ROUND = 200 * 1e18;
-
-    struct RoundInfo {
-        uint256 totalVotes;
-        uint256 finalizedTime; // 只有 finalized 后才记录，用于历史溯源
+    struct Round {
         address seatToken;
-        bool finalized;
-        mapping(address => uint256) candidateVotes;
-        mapping(address => bool) hasClaimed;
+        bool initialized;
     }
 
-    mapping(uint256 => RoundInfo) public rounds;
-    // 聚合 5 个活跃槽位
-    address[5] public activeSeatTokens;
+    mapping(uint256 => Round) public rounds;
+    mapping(address => address) private _userDelegates;
 
-    constructor(address _tokenA, address _factory) {
-        tokenA = ITokenA(_tokenA);
+    bytes32 private constant DELEGATION_TYPEHASH =
+        keccak256("Delegation(address delegatee,uint256 nonce,uint256 expiry)");
+
+    // --- 事件 ---
+    event RoundInitialized(uint256 indexed roundId, address tokenAddress);
+    event SeatMinted(
+        uint256 indexed roundId,
+        address indexed to,
+        uint256 amount
+    );
+
+    constructor(address _factory) EIP712("ProportionalElection", "1") {
         seatFactory = ISeatTokenFactory(_factory);
         genesisTime = block.timestamp;
     }
 
-    // =====================================================
-    // Epoch 计算逻辑
-    // =====================================================
-
-    function currentRoundId() public view returns (uint256) {
-        return (block.timestamp - genesisTime) / ELECTION_CYCLE;
-    }
+    // =============================================================
+    //                      核心 Mint 逻辑
+    // =============================================================
 
     /**
-     * @dev 检查当前是否在投票窗口内（每个周期的前 7 天）
+     * @notice 在当前轮次铸造席位
+     * @param to 接收者地址
+     * @param amount 原始份额数量（将被归一化）
      */
-    function isVotingPeriod() public view returns (bool) {
-        return
-            (block.timestamp - genesisTime) % ELECTION_CYCLE < VOTING_DURATION;
-    }
+    function mint(address to, uint256 amount) external {
+        uint256 rId = currentRoundId();
 
-    // =====================================================
-    // 核心业务逻辑
-    // =====================================================
-
-    /**
-     * @dev 投票：只能在投票窗口内进行
-     */
-    function vote(address candidate, uint256 amount) external {
-        require(isVotingPeriod(), "Voting closed");
-
-        uint256 roundId = currentRoundId();
-        tokenA.burnFrom(msg.sender, amount);
-
-        rounds[roundId].candidateVotes[candidate] += amount;
-        rounds[roundId].totalVotes += amount;
-    }
-
-    /**
-     * @dev 结算：投票窗口结束后可调用。
-     * 该函数实现了“精准轮换”：只有此时才会替换掉 5 年前的旧合约，
-     * 保证了选举期间投票权不会从 100% 掉到 80%。
-     */
-    function finalizeRound(uint256 roundId) external {
-        // 只能结算过去或者已经结束投票的轮次
-        if (roundId == currentRoundId()) {
-            require(!isVotingPeriod(), "Voting still active");
+        if (!rounds[rId].initialized) {
+            _initializeRound(rId);
         }
-        require(!rounds[roundId].finalized, "Already finalized");
 
-        // 部署新合约
+        ISeatToken(rounds[rId].seatToken).mint(to, amount);
+
+        // 同步用户在聚合层设置的委派选择
+        address currentDel = _userDelegates[to];
+        if (currentDel != address(0) && currentDel != to) {
+            ISeatToken(rounds[rId].seatToken).forceDelegate(to, currentDel);
+        }
+
+        emit SeatMinted(rId, to, amount);
+    }
+
+    function _initializeRound(uint256 rId) internal {
         address newToken = seatFactory.createSeatToken(
-            string(abi.encodePacked("Council ", _uintToString(roundId))),
+            string(abi.encodePacked("Council Seat ", _uintToString(rId))),
             "CS",
             address(this)
         );
+        rounds[rId].seatToken = newToken;
+        rounds[rId].initialized = true;
+        emit RoundInitialized(rId, newToken);
+    }
 
-        rounds[roundId].seatToken = newToken;
-        rounds[roundId].finalized = true;
-        rounds[roundId].finalizedTime = block.timestamp;
+    // =============================================================
+    //                      滑动窗口与权重数学
+    // =============================================================
 
-        // 核心：轮替 5 年前的旧席位
-        activeSeatTokens[roundId % 5] = newToken;
+    /**
+     * @notice 计算指定时间点下起效的轮次区间
+     * @dev 逻辑：
+     * 1. 确定时间点所属的 rId 和 周期内偏移。
+     * 2. 若在每年的前 30 天，则不计入当前 rId，使用 (rId-1) 作为窗口末端。
+     * 3. 窗口大小固定为最近的 5 届有效合约。
+     * @return startId 窗口起始轮次
+     * @return endId 窗口结束轮次
+     */
+    function getActiveRange(
+        uint256 timepoint
+    ) public view returns (uint256 startId, uint256 endId) {
+        if (timepoint < genesisTime) return (1, 0); // 返回无效区间
+
+        uint256 elapsed = timepoint - genesisTime;
+        uint256 rId = elapsed / CYCLE_DURATION;
+        uint256 offset = elapsed % CYCLE_DURATION;
+
+        // 处理缓冲期偏移
+        if (offset < BUFFER_DURATION) {
+            // 系统启动的前 30 天，没有任何席位生效
+            if (rId == 0) return (1, 0);
+            endId = rId - 1;
+        } else {
+            endId = rId;
+        }
+
+        // 追溯过去 4 届，总共包含 5 届
+        startId = endId >= (MAX_ACTIVE_ROUNDS - 1)
+            ? endId - (MAX_ACTIVE_ROUNDS - 1)
+            : 0;
     }
 
     /**
-     * @dev 领奖：按比例 Mint 席位
+     * @dev 核心数学公式：(原始票数 * 100) / 年度总发行量
      */
-    function claimSeats(uint256 roundId, address candidate) external {
-        RoundInfo storage round = rounds[roundId];
-        require(round.finalized, "Not finalized");
-        require(!round.hasClaimed[candidate], "Already claimed");
-
-        uint256 votes = round.candidateVotes[candidate];
-        require(votes > 0, "No votes cast");
-
-        uint256 amount = (votes * SEATS_PER_ROUND) / round.totalVotes;
-        round.hasClaimed[candidate] = true;
-
-        ISeatToken(round.seatToken).mint(candidate, amount);
+    function _normalize(
+        uint256 amount,
+        uint256 supply
+    ) internal pure returns (uint256) {
+        if (supply == 0 || amount == 0) return 0;
+        return (amount * WEIGHT_PER_YEAR) / supply;
     }
 
-    // =====================================================
-    // IVotes 聚合与历史修复
-    // =====================================================
+    // =============================================================
+    //                      IVotes 聚合实现
+    // =============================================================
 
-    /**
-     * @dev 实时票数聚合
-     */
     function getVotes(address account) public view override returns (uint256) {
-        uint256 total = 0;
-        for (uint256 i = 0; i < 5; i++) {
-            address token = activeSeatTokens[i];
+        (uint256 start, uint256 end) = getActiveRange(block.timestamp);
+        if (start > end) return 0;
+
+        uint256 totalWeight = 0;
+        for (uint256 r = start; r <= end; r++) {
+            address token = rounds[r].seatToken;
             if (token != address(0)) {
-                total += IVotes(token).getVotes(account);
+                totalWeight += _normalize(
+                    IVotes(token).getVotes(account),
+                    IERC20(token).totalSupply()
+                );
             }
         }
-        return total;
+        return totalWeight;
     }
 
-    /**
-     * @dev 历史票数修复：利用 finalizedTime 寻找 timepoint 当时有效的合约
-     */
     function getPastVotes(
         address account,
         uint256 timepoint
     ) public view override returns (uint256) {
-        uint256 targetRoundId = type(uint256).max;
+        (uint256 start, uint256 end) = getActiveRange(timepoint);
+        if (start > end) return 0;
 
-        // 1. 寻找在该 timepoint 之前最后一次 finalize 的 roundId
-        // 因为 roundId 随时间递增，我们从当前 round 向前找
-        uint256 startSearch = currentRoundId();
-        for (uint256 i = startSearch + 1; i > 0; i--) {
-            uint256 rId = i - 1;
-            if (
-                rounds[rId].finalized && rounds[rId].finalizedTime <= timepoint
-            ) {
-                targetRoundId = rId;
-                break;
-            }
-        }
-
-        if (targetRoundId == type(uint256).max) return 0;
-
-        // 2. 聚合 targetRoundId 及其前 4 轮的合约
-        uint256 total = 0;
-        uint256 fromRound = targetRoundId > 4 ? targetRoundId - 4 : 0;
-        for (uint256 r = fromRound; r <= targetRoundId; r++) {
+        uint256 totalWeight = 0;
+        for (uint256 r = start; r <= end; r++) {
             address token = rounds[r].seatToken;
             if (token != address(0)) {
-                total += IVotes(token).getPastVotes(account, timepoint);
+                totalWeight += _normalize(
+                    IVotes(token).getPastVotes(account, timepoint),
+                    IVotes(token).getPastTotalSupply(timepoint)
+                );
             }
         }
-        return total;
+        return totalWeight;
     }
 
-    // 实现 IVotes 要求的其他接口
     function getPastTotalSupply(
         uint256 timepoint
     ) public view override returns (uint256) {
-        uint256 targetRoundId = type(uint256).max;
-        // 寻找 timepoint 对应的最新轮次
-        for (uint256 i = currentRoundId() + 1; i > 0; i--) {
-            uint256 rId = i - 1;
-            if (
-                rounds[rId].finalized && rounds[rId].finalizedTime <= timepoint
-            ) {
-                targetRoundId = rId;
-                break;
-            }
+        (uint256 start, uint256 end) = getActiveRange(timepoint);
+        if (start > end) return 0;
+
+        uint256 activeCount = 0;
+        for (uint256 r = start; r <= end; r++) {
+            if (rounds[r].initialized) activeCount++;
         }
+        return activeCount * WEIGHT_PER_YEAR;
+    }
 
-        if (targetRoundId == type(uint256).max) return 0;
+    // =============================================================
+    //                      委派与签名传播
+    // =============================================================
 
-        uint256 total = 0;
-        uint256 fromRound = targetRoundId > 4 ? targetRoundId - 4 : 0;
-
-        // 动态累加当时有效的合约的总供应量
-        for (uint256 r = fromRound; r <= targetRoundId; r++) {
-            address token = rounds[r].seatToken;
-            if (token != address(0)) {
-                total += IVotes(token).getPastTotalSupply(timepoint);
-            }
-        }
-        return total;
+    function delegate(address delegatee) public override {
+        _delegate(msg.sender, delegatee);
     }
 
     function delegates(address account) public view override returns (address) {
-        return account;
+        return _userDelegates[account];
     }
-    function delegate(address delegatee) public override {}
+
     function delegateBySig(
-        address d,
-        uint256 n,
-        uint256 e,
+        address delegatee,
+        uint256 nonce,
+        uint256 expiry,
         uint8 v,
         bytes32 r,
         bytes32 s
-    ) public override {}
+    ) public override {
+        require(block.timestamp <= expiry, "Signature expired");
+        bytes32 structHash = keccak256(
+            abi.encode(DELEGATION_TYPEHASH, delegatee, nonce, expiry)
+        );
+        bytes32 hash = _hashTypedDataV4(structHash);
+        address signer = ECDSA.recover(hash, v, r, s);
+        _useCheckedNonce(signer, nonce);
+        _delegate(signer, delegatee);
+    }
 
-    // =====================================================
-    // 辅助函数
-    // =====================================================
+    function _delegate(address delegator, address delegatee) internal {
+        address oldDelegate = _userDelegates[delegator];
+        _userDelegates[delegator] = delegatee;
 
-    function getRoundSeatToken(
-        uint256 roundId
-    ) external view returns (address) {
-        return rounds[roundId].seatToken;
+        uint256 cur = currentRoundId();
+        // 路由至可能活跃的最近 6 轮，确保在缓冲期和正式期交替时委派均有效
+        uint256 start = cur >= MAX_ACTIVE_ROUNDS ? cur - MAX_ACTIVE_ROUNDS : 0;
+
+        for (uint256 r = start; r <= cur; r++) {
+            address token = rounds[r].seatToken;
+            if (token != address(0)) {
+                ISeatToken(token).forceDelegate(delegator, delegatee);
+            }
+        }
+        emit DelegateChanged(delegator, oldDelegate, delegatee);
+    }
+
+    // =============================================================
+    //                      工具函数与治理接口
+    // =============================================================
+
+    function currentRoundId() public view returns (uint256) {
+        return (block.timestamp - genesisTime) / CYCLE_DURATION;
+    }
+
+    function clock() public view returns (uint48) {
+        return uint48(block.timestamp);
+    }
+
+    function CLOCK_MODE() public view returns (string memory) {
+        return "mode=timestamp";
+    }
+
+    function nonces(address owner) public view override returns (uint256) {
+        return super.nonces(owner);
+    }
+
+    function DOMAIN_SEPARATOR() external view returns (bytes32) {
+        return _domainSeparatorV4();
     }
 
     function _uintToString(uint256 v) internal pure returns (string memory) {
