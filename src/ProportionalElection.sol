@@ -13,11 +13,11 @@ import "./interfaces/ISeatTokenFactory.sol";
  * @notice 动态权重治理聚合器：
  * 1. 每一年的总治理权重被归一化为 100 票。
  * 2. 采用 5 年滑动窗口，总治理权上限为 500 票。
- * 3. 每一轮次（360天）的前 30 天为“积累缓冲期”，该轮次的权重暂不计入总投票权。
+ * 3. 每一轮次（365天）的前 30 天为“积累缓冲期”，该轮次的权重暂不计入总投票权。
  */
 contract ProportionalElection is IVotes, EIP712, Nonces {
     // --- 常量定义 ---
-    uint256 public constant CYCLE_DURATION = 360 days;
+    uint256 public constant CYCLE_DURATION = 365 days;
     uint256 public constant BUFFER_DURATION = 30 days;
     uint256 public constant WEIGHT_PER_YEAR = 100 * 1e18; // 归一化基准
     uint256 public constant MAX_ACTIVE_ROUNDS = 5; // 活跃窗口长度
@@ -25,6 +25,7 @@ contract ProportionalElection is IVotes, EIP712, Nonces {
     // --- 状态变量 ---
     ISeatTokenFactory public immutable seatFactory;
     uint256 public immutable genesisTime;
+    address public immutable minter; // 权限：铸造执行者
 
     struct Round {
         address seatToken;
@@ -45,8 +46,12 @@ contract ProportionalElection is IVotes, EIP712, Nonces {
         uint256 amount
     );
 
-    constructor(address _factory) EIP712("ProportionalElection", "1") {
+    constructor(
+        address _factory,
+        address _minter
+    ) EIP712("ProportionalElection", "1") {
         seatFactory = ISeatTokenFactory(_factory);
+        minter = _minter;
         genesisTime = block.timestamp;
     }
 
@@ -60,6 +65,7 @@ contract ProportionalElection is IVotes, EIP712, Nonces {
      * @param amount 原始份额数量（将被归一化）
      */
     function mint(address to, uint256 amount) external {
+        require(msg.sender == minter, "ProportionalElection: only minter");
         uint256 rId = currentRoundId();
 
         if (!rounds[rId].initialized) {
